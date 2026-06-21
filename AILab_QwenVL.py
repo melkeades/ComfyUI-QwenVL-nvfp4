@@ -17,6 +17,7 @@ import gc
 import json
 import os
 import platform
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 
@@ -48,6 +49,9 @@ except ImportError:
 NODE_DIR = Path(__file__).parent
 CONFIG_PATH = NODE_DIR / "hf_models.json"
 SYSTEM_PROMPTS_PATH = NODE_DIR / "AILab_System_Prompts.json"
+BYTES_PER_GIB = 1024 ** 3
+NVFP4_F4_E2M1_MAX = 6.0
+NVFP4_F8_E4M3_MAX = 448.0
 HF_VL_MODELS: dict[str, dict] = {}
 HF_TEXT_MODELS: dict[str, dict] = {}
 HF_ALL_MODELS: dict[str, dict] = {}
@@ -513,16 +517,331 @@ def is_fp8_model(model_name: str) -> bool:
     return any(indicator in model_name for indicator in fp8_indicators)
 
 
+def is_nvfp4_model(model_name: str) -> bool:
+    """Check if model config identifies a compressed-tensors NVFP4 checkpoint."""
+    info = HF_ALL_MODELS.get(model_name, {})
+    quantization_format = str(info.get("quantization_format", "")).lower()
+    repo_id = str(info.get("repo_id", "")).lower()
+    model_key = str(model_name or "").lower()
+    return quantization_format == "nvfp4" or "nvfp4" in repo_id or "nvfp4" in model_key
+
+
+def is_prequantized_fp8_model(model_name: str) -> bool:
+    """Existing quantized entries are FP8 unless a more specific format is declared."""
+    info = HF_ALL_MODELS.get(model_name, {})
+    return is_fp8_model(model_name) or (bool(info.get("quantized")) and not is_nvfp4_model(model_name))
+
+
+def cuda_device_inventory() -> list[str]:
+    if not torch.cuda.is_available():
+        return []
+    return [f"cuda:{idx}={torch.cuda.get_device_name(idx)}" for idx in range(torch.cuda.device_count())]
+
+
+def require_nvfp4_cuda_device() -> str:
+    if not torch.cuda.is_available():
+        raise RuntimeError("[QwenVL] NVFP4 model requires CUDA; no CUDA device is available.")
+    if torch.cuda.device_count() < 1:
+        raise RuntimeError("[QwenVL] NVFP4 model requires cuda:0; no CUDA devices were detected.")
+
+    devices = cuda_device_inventory()
+    print(f"[QwenVL] NVFP4 CUDA devices: {', '.join(devices)}")
+    target_name = torch.cuda.get_device_name(0)
+    if "5090" not in target_name:
+        raise RuntimeError(
+            "[QwenVL] NVFP4 model is pinned to cuda:0 / RTX 5090, "
+            f"but cuda:0 is '{target_name}'. Set CUDA_DEVICE_ORDER=PCI_BUS_ID before launch "
+            "or adjust the device guard."
+        )
+    torch.cuda.set_device(0)
+    return "cuda:0"
+
+
+def nvfp4_cuda0_memory_budget_gib() -> int:
+    free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+    reserve_bytes = max(8 * BYTES_PER_GIB, int(total_bytes * 0.20))
+    usable_bytes = min(free_bytes - reserve_bytes, total_bytes - reserve_bytes)
+    if usable_bytes < 8 * BYTES_PER_GIB:
+        raise RuntimeError(
+            "[QwenVL] NVFP4 model needs at least 8 GiB free on cuda:0 after reserve; "
+            f"free={free_bytes / BYTES_PER_GIB:.1f} GiB, reserve={reserve_bytes / BYTES_PER_GIB:.1f} GiB."
+        )
+    return max(8, int(usable_bytes // BYTES_PER_GIB))
+
+
+def nvfp4_transformers_load_kwargs() -> dict:
+    target_device = require_nvfp4_cuda_device()
+    cuda0_budget_gib = nvfp4_cuda0_memory_budget_gib()
+    print(
+        "[QwenVL] NVFP4 direct cuda:0 load: "
+        f"{cuda0_budget_gib} GiB usable after reserve; CPU/disk offload disabled"
+    )
+    return {
+        "target_device": target_device,
+        "device_map": {"": target_device},
+    }
+
+
+def nvfp4_quantization_config(model_path: str):
+    from transformers.utils.quantization_config import CompressedTensorsConfig
+
+    with open(Path(model_path) / "config.json", "r", encoding="utf-8") as fh:
+        raw_config = json.load(fh)
+    raw_quantization = raw_config.get("quantization_config")
+    if not raw_quantization:
+        raise RuntimeError(f"[QwenVL] Missing quantization_config in NVFP4 model: {model_path}")
+    config = CompressedTensorsConfig.from_dict(raw_quantization, run_compressed=True)
+    config.run_compressed = True
+    return config
+
+
+def device_to_string(device) -> str:
+    if isinstance(device, torch.device):
+        return str(device)
+    return str(device)
+
+
+def cuda_index_from_device(device):
+    if isinstance(device, int):
+        return device
+    try:
+        parsed = torch.device(device)
+    except Exception:
+        return None
+    if parsed.type != "cuda":
+        return None
+    return 0 if parsed.index is None else parsed.index
+
+
+def summarize_device_map(model) -> dict[str, str]:
+    device_map = getattr(model, "hf_device_map", None) or {}
+    return {str(name): device_to_string(device) for name, device in device_map.items()}
+
+
+def summarize_parameter_devices(model, sample_limit: int = 20) -> dict:
+    devices = set()
+    samples = []
+    for name, parameter in model.named_parameters():
+        device = device_to_string(parameter.device)
+        devices.add(device)
+        if len(samples) < sample_limit:
+            samples.append({"name": name, "device": device})
+    return {"devices": sorted(devices), "sample": samples}
+
+
+def validate_nvfp4_device_placement(model) -> None:
+    blocked = []
+    for name, device in summarize_device_map(model).items():
+        if cuda_index_from_device(device) == 1:
+            blocked.append(f"device_map:{name}->{device}")
+
+    for name, parameter in model.named_parameters():
+        if parameter.device.type == "cuda" and parameter.device.index == 1:
+            blocked.append(f"parameter:{name}->{parameter.device}")
+            if len(blocked) >= 20:
+                break
+
+    if blocked:
+        raise RuntimeError(
+            "[QwenVL] NVFP4 model attempted to use cuda:1 / RTX 4090. "
+            f"Blocked placements: {', '.join(blocked)}"
+        )
+
+
+def nvfp4_linear_forward_decompressed(self, input):
+    from compressed_tensors.compressors.nvfp4.base import NVFP4PackedCompressor
+    from compressed_tensors.utils import get_direct_state_dict
+
+    state_dict = get_direct_state_dict(self)
+    decompressed = NVFP4PackedCompressor.decompress(state_dict, self.quantization_scheme)
+    weight = decompressed["weight"].to(device=input.device, dtype=input.dtype)
+    bias = decompressed.get("bias")
+    if bias is not None:
+        bias = bias.to(device=input.device, dtype=input.dtype)
+    return torch.nn.functional.linear(input, weight, bias)
+
+
+def nvfp4_tensor_scale_from_module_or_input(state_dict: dict, input_2d: torch.Tensor) -> torch.Tensor:
+    force_dynamic = os.environ.get("QWENVL_NVFP4_DYNAMIC_INPUT_SCALE") == "1"
+    input_global_scale = state_dict.get("input_global_scale")
+    if input_global_scale is not None and not force_dynamic:
+        input_global_scale = input_global_scale.to(
+            device=input_2d.device, dtype=torch.float32, non_blocking=True
+        ).reshape(1)
+        return torch.reciprocal(input_global_scale)
+
+    max_abs = input_2d.detach().abs().amax().to(dtype=torch.float32)
+    scale = max_abs / (NVFP4_F8_E4M3_MAX * NVFP4_F4_E2M1_MAX)
+    return torch.clamp(scale, min=torch.finfo(torch.float32).tiny).reshape(1)
+
+
+def nvfp4_linear_forward_kernel(self, input):
+    import comfy_kitchen as ck
+    from compressed_tensors.utils import get_direct_state_dict
+
+    if input.device.type != "cuda":
+        raise RuntimeError("comfy_kitchen NVFP4 kernel requires CUDA input")
+    if torch.cuda.get_device_capability(input.device)[0] < 10:
+        raise RuntimeError("comfy_kitchen NVFP4 kernel requires Blackwell/SM100 or newer")
+
+    state_dict = get_direct_state_dict(self)
+    weight_packed = state_dict["weight_packed"].to(
+        device=input.device, dtype=torch.uint8, non_blocking=True
+    ).contiguous()
+    weight_scale = state_dict["weight_scale"].to(device=input.device, non_blocking=True).contiguous()
+    weight_scale = ck.to_blocked(weight_scale, flatten=False).contiguous()
+    weight_global_scale = state_dict["weight_global_scale"].to(
+        device=input.device, dtype=torch.float32, non_blocking=True
+    ).reshape(1)
+    weight_tensor_scale = torch.reciprocal(weight_global_scale)
+
+    in_features = getattr(self, "in_features", weight_packed.shape[1] * 2)
+    out_features = getattr(self, "out_features", weight_packed.shape[0])
+    input_shape = input.shape
+    input_2d = input.reshape(-1, input_shape[-1])
+    if input_2d.shape[-1] != in_features:
+        raise RuntimeError(
+            f"NVFP4 Linear input mismatch: input has {input_2d.shape[-1]} features, "
+            f"module expects {in_features}."
+        )
+
+    out_dtype = input.dtype if input.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+    input_2d = input_2d.to(dtype=out_dtype).contiguous()
+    input_tensor_scale = nvfp4_tensor_scale_from_module_or_input(state_dict, input_2d)
+    input_packed, input_block_scale = ck.quantize_nvfp4(
+        input_2d,
+        input_tensor_scale,
+        pad_16x=True,
+        hi_first=False,
+    )
+
+    bias = state_dict.get("bias")
+    if bias is not None:
+        bias = bias.to(device=input.device, dtype=out_dtype, non_blocking=True)
+
+    output = ck.scaled_mm_nvfp4(
+        input_packed,
+        weight_packed,
+        tensor_scale_a=input_tensor_scale,
+        tensor_scale_b=weight_tensor_scale,
+        block_scale_a=input_block_scale,
+        block_scale_b=weight_scale,
+        bias=bias,
+        out_dtype=out_dtype,
+    )
+    output = output[: input_2d.shape[0], :out_features]
+    return output.reshape(*input_shape[:-1], out_features)
+
+
+def nvfp4_linear_forward_dequant_kernel(self, input):
+    import comfy_kitchen as ck
+    from compressed_tensors.utils import get_direct_state_dict
+
+    if input.device.type != "cuda":
+        raise RuntimeError("comfy_kitchen NVFP4 dequant kernel requires CUDA input")
+
+    state_dict = get_direct_state_dict(self)
+    weight_packed = state_dict["weight_packed"].to(
+        device=input.device, dtype=torch.uint8, non_blocking=True
+    ).contiguous()
+    weight_scale = state_dict["weight_scale"].to(device=input.device, non_blocking=True).contiguous()
+    weight_scale = ck.to_blocked(weight_scale, flatten=False).contiguous()
+    weight_global_scale = state_dict["weight_global_scale"].to(
+        device=input.device, dtype=torch.float32, non_blocking=True
+    ).reshape(1)
+    weight_tensor_scale = torch.reciprocal(weight_global_scale)
+
+    in_features = getattr(self, "in_features", weight_packed.shape[1] * 2)
+    out_features = getattr(self, "out_features", weight_packed.shape[0])
+    out_dtype = input.dtype if input.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+
+    weight = ck.dequantize_nvfp4(
+        weight_packed,
+        per_tensor_scale=weight_tensor_scale,
+        block_scales=weight_scale,
+        output_type=out_dtype,
+        hi_first=False,
+    )[:out_features, :in_features]
+
+    bias = state_dict.get("bias")
+    if bias is not None:
+        bias = bias.to(device=input.device, dtype=out_dtype, non_blocking=True)
+
+    return torch.nn.functional.linear(input.to(dtype=out_dtype), weight, bias)
+
+
+def nvfp4_linear_forward(self, input):
+    try:
+        if os.environ.get("QWENVL_NVFP4_W4A4_KERNEL") == "1":
+            return nvfp4_linear_forward_kernel(self, input)
+        return nvfp4_linear_forward_dequant_kernel(self, input)
+    except Exception as exc:
+        if not getattr(self, "_nvfp4_kernel_warned", False):
+            print(f"[QwenVL] NVFP4 kernel fallback for {self.__class__.__name__}: {exc}")
+            self._nvfp4_kernel_warned = True
+        return nvfp4_linear_forward_decompressed(self, input)
+
+
+def enable_nvfp4_linear_forward(model) -> int:
+    if hasattr(model, "ct_decompress_hook"):
+        model.ct_decompress_hook.remove()
+        delattr(model, "ct_decompress_hook")
+
+    patched = 0
+    for module in model.modules():
+        if isinstance(module, torch.nn.Linear) and hasattr(module, "weight_packed"):
+            bound_forward = nvfp4_linear_forward.__get__(module, module.__class__)
+            if hasattr(module, "_old_forward"):
+                module._old_forward = bound_forward
+            else:
+                module.forward = bound_forward
+            patched += 1
+    print(f"[QwenVL] NVFP4: patched {patched} compressed Linear forwards for CUDA dequant execution")
+    return patched
+
+
+@contextmanager
+def nvfp4_torchdynamo_disabled(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    env_names = ("TORCHDYNAMO_DISABLE", "TORCH_COMPILE_DISABLE")
+    previous_env = {name: os.environ.get(name) for name in env_names}
+    previous_dynamo_disable = None
+    dynamo_config = None
+    try:
+        import torch._dynamo as torch_dynamo
+
+        dynamo_config = torch_dynamo.config
+        previous_dynamo_disable = getattr(dynamo_config, "disable", None)
+    except Exception:
+        dynamo_config = None
+
+    try:
+        for name in env_names:
+            os.environ[name] = "1"
+        if dynamo_config is not None and previous_dynamo_disable is not None:
+            dynamo_config.disable = True
+        print("[QwenVL] NVFP4: TorchDynamo and torch.compile disabled for this run")
+        yield
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        if dynamo_config is not None and previous_dynamo_disable is not None:
+            dynamo_config.disable = previous_dynamo_disable
+
+
 def quantization_config(model_name, quantization):
-    """Returns (quant_config, dtype, is_prequantized_fp8).
+    """Returns (quant_config, dtype, is_prequantized).
     
-    For pre-quantized FP8 models, we need special handling:
-    - Don't use device_map (load directly to device)
-    - Don't use flash_attention_2 (only supports fp16/bf16)
+    Pre-quantized models are loaded without BitsAndBytes.
     """
     info = HF_ALL_MODELS.get(model_name, {})
-    if info.get("quantized") or is_fp8_model(model_name):
-        # Pre-quantized model (FP8, etc.)
+    if info.get("quantized") or is_fp8_model(model_name) or is_nvfp4_model(model_name):
         return None, None, True
     if quantization == Quantization.Q4:
         cfg = BitsAndBytesConfig(
@@ -543,20 +862,26 @@ class QwenVLBase:
         self.processor = None
         self.tokenizer = None
         self.current_signature = None
+        self.last_model_path = None
+        self.last_device_map = {}
+        self.last_parameter_devices = {}
+        self.current_is_nvfp4 = False
         print(f"[QwenVL] Node on {self.device_info['device_type']}")
 
     def clear(self):
         """Clear model from memory and free VRAM."""
         if self.model is not None:
             # Move model to CPU first to free GPU memory
-            try:
-                self.model = self.model.cpu()
-            except:
-                pass
+            if not self.current_is_nvfp4:
+                try:
+                    self.model = self.model.cpu()
+                except:
+                    pass
             self.model = None
         self.processor = None
         self.tokenizer = None
         self.current_signature = None
+        self.current_is_nvfp4 = False
         
         # Force garbage collection
         gc.collect()
@@ -575,23 +900,32 @@ class QwenVLBase:
         device_choice,
         keep_model_loaded,
     ):
-        quant = enforce_memory(model_name, Quantization.from_value(quant_value), self.device_info)
+        requested_quant = Quantization.from_value(quant_value)
+        is_prequantized_nvfp4 = is_nvfp4_model(model_name)
+        is_prequantized_fp8 = is_prequantized_fp8_model(model_name)
+        is_prequantized = is_prequantized_nvfp4 or is_prequantized_fp8
+
+        if is_prequantized:
+            quant = requested_quant
+            if requested_quant != Quantization.FP16:
+                print(f"[QwenVL] {model_name} is pre-quantized; ignoring BitsAndBytes quantization selector")
+        else:
+            quant = enforce_memory(model_name, requested_quant, self.device_info)
         
         # Check if BitsAndBytes quantization is being used
-        is_bnb_quantization = quant in [Quantization.Q4, Quantization.Q8]
+        is_bnb_quantization = not is_prequantized and quant in [Quantization.Q4, Quantization.Q8]
         
-        # Check if this is a pre-quantized FP8 model
-        is_prequantized_fp8 = is_fp8_model(model_name) or HF_ALL_MODELS.get(model_name, {}).get("quantized", False)
-        
-        # Determine if we need to force SDPA (for FP8 or BitsAndBytes models)
-        force_sdpa = is_prequantized_fp8 or is_bnb_quantization
+        # Determine if we need to force SDPA (for pre-quantized or BitsAndBytes models)
+        force_sdpa = is_prequantized or is_bnb_quantization
         
         # Resolve attention mode with force_sdpa flag
         attn_impl = resolve_attention_mode(attention_mode, force_sdpa=force_sdpa)
         
         # Additional info messages for forced SDPA
         if force_sdpa and attention_mode in ["auto", "sage", "flash_attention_2"]:
-            if is_prequantized_fp8:
+            if is_prequantized_nvfp4:
+                print("[QwenVL] NVFP4 compressed-tensors model detected - forcing SDPA attention")
+            elif is_prequantized_fp8:
                 print("[QwenVL] FP8 model detected - forcing SDPA attention")
             elif is_bnb_quantization:
                 print("[QwenVL] BitsAndBytes quantization detected - forcing SDPA attention")
@@ -600,7 +934,10 @@ class QwenVLBase:
         
         device_requested = self.device_info["recommended_device"] if device_choice == "auto" else device_choice
         device = normalize_device_choice(device_requested)
-        signature = (model_name, quant.value, attn_impl, device, use_compile)
+        effective_use_compile = bool(use_compile) and not is_prequantized_nvfp4
+        if use_compile and is_prequantized_nvfp4:
+            print("[QwenVL] NVFP4: torch.compile disabled for this model")
+        signature = (model_name, quant.value, attn_impl, device, effective_use_compile)
         
         # Check if we need to reload (model, quantization, or attention changed)
         if keep_model_loaded and self.model is not None and self.current_signature == signature:
@@ -610,7 +947,10 @@ class QwenVLBase:
         if self.model is not None:
             print("[QwenVL] Clearing previous model from memory before loading new configuration...")
         self.clear()
+        self.last_device_map = {}
+        self.last_parameter_devices = {}
         model_path = ensure_model(model_name)
+        self.last_model_path = model_path
         quant_config, dtype, _ = quantization_config(model_name, quant)
         
         # Handle attention mode for loading
@@ -625,7 +965,29 @@ class QwenVLBase:
             "use_safetensors": True,
         }
         
-        if is_prequantized_fp8:
+        if is_prequantized_nvfp4:
+            nvfp4_load_settings = nvfp4_transformers_load_kwargs()
+            target_device = nvfp4_load_settings.pop("target_device")
+            if device not in {"auto", "cuda", target_device}:
+                print(f"[QwenVL] NVFP4: ignoring requested device '{device}' and using {target_device}")
+
+            load_kwargs.update(nvfp4_load_settings)
+            load_kwargs["dtype"] = "auto"
+            load_kwargs["quantization_config"] = nvfp4_quantization_config(model_path)
+
+            print(f"[QwenVL] Loading NVFP4 compressed-tensors model directly on {target_device}...")
+            try:
+                self.current_is_nvfp4 = True
+                self.model = AutoModelForVision2Seq.from_pretrained(model_path, **load_kwargs).eval()
+                enable_nvfp4_linear_forward(self.model)
+                validate_nvfp4_device_placement(self.model)
+                self.last_device_map = summarize_device_map(self.model)
+                self.last_parameter_devices = summarize_parameter_devices(self.model)
+                print(f"[QwenVL] NVFP4 model loaded on {target_device}")
+            except Exception:
+                self.clear()
+                raise
+        elif is_prequantized_fp8:
             # For pre-quantized FP8 models: load directly to device, don't use device_map
             # This prevents meta tensor issues
             
@@ -740,7 +1102,7 @@ class QwenVLBase:
         self.model.config.use_cache = True
         if hasattr(self.model, "generation_config"):
             self.model.generation_config.use_cache = True
-        if use_compile and device.startswith("cuda") and torch.cuda.is_available():
+        if effective_use_compile and device.startswith("cuda") and torch.cuda.is_available():
             try:
                 self.model = torch.compile(self.model, mode="reduce-overhead")
                 print("[QwenVL] torch.compile enabled")
@@ -788,7 +1150,7 @@ class QwenVLBase:
         video_frames = [frame for item in conversation[0]["content"] if item["type"] == "video" for frame in item["video"]]
         videos = [video_frames] if video_frames else None
         processed = self.processor(text=chat, images=images or None, videos=videos, return_tensors="pt")
-        model_device = next(self.model.parameters()).device
+        model_device = torch.device("cuda:0") if self.current_is_nvfp4 else next(self.model.parameters()).device
         model_inputs = {
             key: value.to(model_device) if torch.is_tensor(value) else value
             for key, value in processed.items()
@@ -825,36 +1187,37 @@ class QwenVLBase:
         
         pbar.update_absolute(1, 3, None)
         
-        self.load_model(
-            model_name,
-            quantization,
-            attention_mode,
-            use_torch_compile,
-            device,
-            keep_model_loaded,
-        )
-        
-        pbar.update_absolute(2, 3, None)
-        
-        try:
-            text = self.generate(
-                prompt,
-                image,
-                video,
-                frame_count,
-                max_tokens,
-                temperature,
-                top_p,
-                num_beams,
-                repetition_penalty,
+        with nvfp4_torchdynamo_disabled(is_nvfp4_model(model_name)):
+            self.load_model(
+                model_name,
+                quantization,
+                attention_mode,
+                use_torch_compile,
+                device,
+                keep_model_loaded,
             )
             
-            pbar.update_absolute(3, 3, None)
+            pbar.update_absolute(2, 3, None)
             
-            return (text,)
-        finally:
-            if not keep_model_loaded:
-                self.clear()
+            try:
+                text = self.generate(
+                    prompt,
+                    image,
+                    video,
+                    frame_count,
+                    max_tokens,
+                    temperature,
+                    top_p,
+                    num_beams,
+                    repetition_penalty,
+                )
+                
+                pbar.update_absolute(3, 3, None)
+                
+                return (text,)
+            finally:
+                if not keep_model_loaded:
+                    self.clear()
 
 class AILab_QwenVL(QwenVLBase):
     @classmethod

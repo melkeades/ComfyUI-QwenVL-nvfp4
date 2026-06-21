@@ -136,6 +136,15 @@
         "full": 24.0
       }
     },
+    "Qwen3-VL-32B-Instruct-NVFP4": {
+      "repo_id": "RedHatAI/Qwen3-VL-32B-Instruct-NVFP4",
+      "default": false,
+      "quantized": true,
+      "quantization_format": "nvfp4",
+      "vram_requirement": {
+        "full": 24.0
+      }
+    },
     "Qwen3-VL-32B-Thinking-FP8": {
       "repo_id": "Qwen/Qwen3-VL-32B-Thinking-FP8",
       "default": false,
